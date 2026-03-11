@@ -11,6 +11,8 @@ import {
   buildRequestEvent, buildAcceptEvent, buildDeclineEvent,
   subscribeToRequests, fetchIncomingRequests,
   compressImageToBase64, audioBlobToBase64,
+  buildGroupInviteEvent, buildGroupMessageEvent, buildGroupMediaEvent,
+  fetchGroupMessages, subscribeToGroup, subscribeToGroupInvites,
 } from '@/lib/nostr';
 import { createCallSession, subscribeIncomingCalls } from '@/lib/webrtc';
 import { CallOverlay, IncomingCallBanner } from '@/components/CallOverlay';
@@ -20,6 +22,8 @@ import {
   npubToPubkeyHex, pubkeyHexToNpub,
   isValidNpub, isValidPubkeyHex,
   setRequestState, getRequestState, getAllRequestStates,
+  getAllGroups, saveGroup, getGroup, deleteGroup,
+  generateGroupId, generateGroupKey,
 } from '@/lib/identity';
 
 /* ─── avatar gradients ─── */
@@ -146,19 +150,22 @@ function AudioPlayer({ src, isMine }) {
 }
 
 export default function ChatPage() {
-  const { identity, loading, logout, relayStatus } = useAuth();
+  const {
+    identity, loading, logout, relayStatus, updateDisplayName, syncData,
+    contacts, setContacts, groups, setGroups, requestStates, setRequestStates,
+    incomingRequests, setIncomingRequests, syncing, setSyncing
+  } = useAuth();
   const params     = useParams();
   const router     = useRouter();
-  const peerPubkey = (!params?.chatId || params.chatId === '_') ? null : params.chatId;
+  const rawChatId  = params?.chatId || '_';
+  const isGroup    = rawChatId.startsWith('grp_');
+  const peerPubkey = (!rawChatId || rawChatId === '_' || isGroup) ? null : rawChatId;
+  const groupId    = isGroup ? rawChatId : null;
 
-  const [contacts,          setContacts]          = useState({});
-  const [requestStates,     setRequestStates]     = useState({});
   const [messages,          setMessages]          = useState([]);
   const [loadingMsgs,       setLoadingMsgs]       = useState(false);
-  const [syncing,           setSyncing]           = useState(false);
   const [input,             setInput]             = useState('');
   const [sending,           setSending]           = useState(false);
-  const [incomingRequests,  setIncomingRequests]  = useState([]);
   const [mediaSending,      setMediaSending]      = useState(false); // separate spinner for media
 
   const [showAdd,  setShowAdd]  = useState(false);
@@ -167,7 +174,11 @@ export default function ChatPage() {
   const [addError, setAddError] = useState('');
   const [addBusy,  setAddBusy]  = useState(false);
 
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings,  setShowSettings]  = useState(false);
+  const [editingName,   setEditingName]   = useState(false);
+  const [nameInput,     setNameInput]     = useState('');
+  const [nameSaving,    setNameSaving]    = useState(false);
+  const [nameSaved,     setNameSaved]     = useState(false);
   const [search,       setSearch]       = useState('');
   const [copied,       setCopied]       = useState('');
   const [relayInput,   setRelayInput]   = useState('');
@@ -186,6 +197,20 @@ export default function ChatPage() {
   const recTimerRef  = useRef(null);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // ── Group state ─────────────────────────────────────────────────────────────────
+  const [currentGroup,   setCurrentGroup]   = useState(null);  // group object
+  const [showNewGroup,   setShowNewGroup]   = useState(false);
+  const [groupName,      setGroupName]      = useState('');
+  const [groupMembers,   setGroupMembers]   = useState([]);    // [{pubkeyHex, displayName}]
+  const [groupMemberInput, setGroupMemberInput] = useState('');
+  const [groupMemberError, setGroupMemberError] = useState('');
+  const [groupCreating,  setGroupCreating]  = useState(false);
+  const [showGroupInfo,  setShowGroupInfo]  = useState(false);
+  const [addMemberInput, setAddMemberInput] = useState('');
+  const [addMemberError, setAddMemberError] = useState('');
+  const unsubGroupRef = useRef(null);
+  const unsubGroupInviteRef = useRef(null);
 
   // ── Call state ──────────────────────────────────────────────────────────────
   const [callSession,   setCallSession]   = useState(null);   // active createCallSession()
@@ -219,7 +244,7 @@ export default function ChatPage() {
     );
     return () => { unsubCallRef.current?.(); unsubCallRef.current = null; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [identity]);
+  }, [identity, callState]);
 
   /* ── Call helpers ── */
   const startCall = useCallback(async (withVideo) => {
@@ -277,32 +302,33 @@ export default function ChatPage() {
     setRemoteStream(null);
   }, [callSession]);
 
-  /* ── load contacts / relays ── */
-  useEffect(() => {
-    if (!identity) return;
-    getContacts().then(setContacts);
-    getAllRequestStates().then(setRequestStates);
-  }, [identity]);
+  /* ── load relays ── */
   useEffect(() => { setUserRelays(getRelays()); }, []);
 
-  /* ── incoming requests ── */
+  /* ── subscribe to incoming group invites (live) ── */
   useEffect(() => {
     if (!identity) return;
-    const since30d = Math.floor(Date.now() / 1000) - 86400 * 30;
-    fetchIncomingRequests(identity.pubkeyHex, identity.privkeyHex, since30d).then(async reqs => {
-      const pending = [];
-      for (const r of reqs) {
-        const st = await getRequestState(r.fromPubkey);
-        if (!st || st.status === 'pending_incoming') {
-          await setRequestState(r.fromPubkey, 'pending_incoming', { displayName: r.displayName });
-          pending.push(r);
+    const setup = async () => {
+      const liveSince = Math.floor(Date.now() / 1000);
+      unsubGroupInviteRef.current = await subscribeToGroupInvites(
+        identity.pubkeyHex, identity.privkeyHex, liveSince,
+        async (invite) => {
+          const existing = await getGroup(invite.groupId);
+          if (!existing) {
+            const group = { groupId: invite.groupId, name: invite.groupName, members: invite.members, groupKeyHex: invite.groupKeyHex, createdAt: Date.now(), createdBy: invite.fromPubkey };
+            await saveGroup(group);
+            setGroups(prev => prev.find(g => g.groupId === invite.groupId) ? prev : [...prev, group]);
+          }
         }
-      }
-      if (pending.length) {
-        setIncomingRequests(prev => { const s = new Set(prev.map(x => x.fromPubkey)); return [...prev, ...pending.filter(x => !s.has(x.fromPubkey))]; });
-        setRequestStates(await getAllRequestStates());
-      }
-    });
+      );
+    };
+    setup();
+    return () => { unsubGroupInviteRef.current?.(); unsubGroupInviteRef.current = null; };
+  }, [identity, setGroups]);
+
+  /* ── subscribe to live requests ── */
+  useEffect(() => {
+    if (!identity) return;
     const liveSince = Math.floor(Date.now() / 1000);
     unsubReqRef.current = subscribeToRequests(
       identity.pubkeyHex, identity.privkeyHex, liveSince,
@@ -317,7 +343,37 @@ export default function ChatPage() {
       async (pk, status) => { await setRequestState(pk, status); setRequestStates(await getAllRequestStates()); }
     );
     return () => { unsubReqRef.current?.(); unsubReqRef.current = null; };
-  }, [identity]);
+  }, [identity, setIncomingRequests, setRequestStates]);
+
+  /* ── load group messages ── */
+  useEffect(() => {
+    if (!identity || !isGroup || !groupId) return;
+    let alive = true;
+    unsubGroupRef.current?.(); unsubGroupRef.current = null;
+    setLoadingMsgs(true);
+    setMessages([]);
+    getGroup(groupId).then(async g => {
+      if (!g || !alive) { setLoadingMsgs(false); return; }
+      setCurrentGroup(g);
+      const cached = await getCachedMessages(groupId);
+      if (!alive) return;
+      setMessages(cached);
+      setLoadingMsgs(false);
+      const sinceTs = cached.length ? Math.floor(Math.max(...cached.map(m => m.ts)) / 1000) : 0;
+      setSyncing(true);
+      fetchGroupMessages(identity.pubkeyHex, groupId, g.groupKeyHex, g.members, sinceTs).then(newMsgs => {
+        if (!alive) return;
+        setSyncing(false);
+        if (newMsgs.length) setMessages(prev => { const seen = new Set(prev.map(m => m.id)); return [...prev, ...newMsgs.filter(m => !seen.has(m.id))].sort((a,b) => a.ts - b.ts); });
+      }).catch(() => setSyncing(false));
+      const liveSince = Math.floor(Date.now() / 1000);
+      subscribeToGroup(identity.pubkeyHex, groupId, g.groupKeyHex, liveSince, msg => {
+        if (!alive) return;
+        setMessages(prev => prev.find(m => m.id === msg.id) ? prev : [...prev, msg].sort((a,b) => a.ts - b.ts));
+      }).then(unsub => { if (!alive) { unsub?.(); return; } unsubGroupRef.current = unsub; });
+    });
+    return () => { alive = false; unsubGroupRef.current?.(); unsubGroupRef.current = null; };
+  }, [identity, isGroup, groupId]);
 
   /* ── load messages for active chat ── */
   useEffect(() => {
@@ -383,6 +439,79 @@ export default function ChatPage() {
       .sort((a, b) => a.ts - b.ts);
   }
 
+  /* ─── send group text ─── */
+  const handleGroupSend = useCallback(async () => {
+    if (!input.trim() || !currentGroup || sending || !identity) return;
+    setSending(true);
+    const text = input.trim();
+    setInput('');
+    if (inputRef.current) { inputRef.current.style.height = '26px'; inputRef.current.focus(); }
+    try {
+      const ev = await buildGroupMessageEvent(text, currentGroup.groupId, currentGroup.members, currentGroup.groupKeyHex, identity.privkeyHex);
+      await publishEvent(ev);
+      const msg = { id: ev.id, peer: currentGroup.groupId, from: identity.pubkeyHex, msgType: 'text', text, ts: ev.created_at * 1000, mine: true, reactions: {}, groupId: currentGroup.groupId };
+      await cacheMessage(msg);
+      setMessages(prev => [...prev, msg]);
+    } catch (err) { console.error('group send failed', err); }
+    finally { setSending(false); }
+  }, [input, currentGroup, sending, identity]);
+
+  /* ─── send group image ─── */
+  const handleGroupImageFile = async (file) => {
+    if (!file || !currentGroup || !identity) return;
+    setMediaSending(true);
+    try {
+      const { b64, mimeType } = await compressImageToBase64(file);
+      const payload = { mediaType: 'image', data: b64, mimeType, fileName: file.name };
+      const ev = await buildGroupMediaEvent(payload, currentGroup.groupId, currentGroup.members, currentGroup.groupKeyHex, identity.privkeyHex);
+      await publishEvent(ev);
+      const msg = { id: ev.id, peer: currentGroup.groupId, from: identity.pubkeyHex, msgType: 'media', mediaType: 'image', data: b64, mimeType, fileName: file.name, ts: ev.created_at * 1000, mine: true, reactions: {}, groupId: currentGroup.groupId };
+      await cacheMessage(msg);
+      setMessages(prev => [...prev, msg]);
+    } catch (err) { alert('Image error: ' + (err?.message || 'Unknown')); }
+    finally { setMediaSending(false); if (fileImgRef.current) fileImgRef.current.value = ''; }
+  };
+
+  /* ─── create group ─── */
+  const handleCreateGroup = async (e) => {
+    e.preventDefault();
+    if (!groupName.trim() || groupMembers.length === 0 || groupCreating || !identity) return;
+    setGroupCreating(true);
+    try {
+      const gid = generateGroupId();
+      const gkey = generateGroupKey();
+      const allMembers = [...new Set([identity.pubkeyHex, ...groupMembers.map(m => m.pubkeyHex)])];
+      const group = { groupId: gid, name: groupName.trim(), members: allMembers, groupKeyHex: gkey, createdAt: Date.now(), createdBy: identity.pubkeyHex };
+      await saveGroup(group);
+      setGroups(prev => [...prev, group]);
+      // Send invite to each member
+      for (const memberHex of groupMembers.map(m => m.pubkeyHex)) {
+        const ev = buildGroupInviteEvent(gid, gkey, group.name, allMembers, identity.privkeyHex, memberHex);
+        await publishEvent(ev);
+        await new Promise(r => setTimeout(r, 100)); // small delay to avoid rate limits
+      }
+      setShowNewGroup(false);
+      setGroupName('');
+      setGroupMembers([]);
+      router.push(`/chat/${gid}`);
+    } catch (err) { console.error('create group failed', err); }
+    finally { setGroupCreating(false); }
+  };
+
+  const addGroupMember = () => {
+    const raw = groupMemberInput.trim();
+    setGroupMemberError('');
+    let pk = null;
+    if (isValidNpub(raw)) pk = npubToPubkeyHex(raw);
+    else if (isValidPubkeyHex(raw)) pk = raw.toLowerCase();
+    else { setGroupMemberError('Enter a valid npub or hex pubkey.'); return; }
+    if (pk === identity?.pubkeyHex) { setGroupMemberError("That's you — you're added automatically."); return; }
+    if (groupMembers.find(m => m.pubkeyHex === pk)) { setGroupMemberError('Already added.'); return; }
+    const contact = contacts[pk];
+    setGroupMembers(prev => [...prev, { pubkeyHex: pk, displayName: contact?.displayName || pk.slice(0,12) }]);
+    setGroupMemberInput('');
+  };
+
   /* ─── send text / edit / reply ─── */
   const handleSend = useCallback(async () => {
     if (!input.trim() || !peerPubkey || sending || !identity) return;
@@ -398,19 +527,19 @@ export default function ChatPage() {
     try {
       if (editingMsg) {
         const ev = buildEditEvent(editingMsg.id, text, identity.privkeyHex, peerPubkey);
-        publishEvent(ev);
+        await publishEvent(ev);
         setMessages(prev => prev.map(m => m.id === editingMsg.id ? { ...m, text, edited: true } : m));
         await cacheMessage({ id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'edit', targetId: editingMsg.id, newText: text, ts: ev.created_at * 1000, mine: true });
         setEditingMsg(null);
       } else if (replyTo) {
         const ev = buildReplyEvent(replyTo.id, replyTo.text || '', text, identity.privkeyHex, peerPubkey);
-        publishEvent(ev);
+        await publishEvent(ev);
         const msg = { id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'reply', replyToId: replyTo.id, replyToText: replyTo.text || '', text, ts: ev.created_at * 1000, mine: true, reactions: {} };
         await cacheMessage(msg);
         setMessages(prev => [...prev, msg]);
       } else {
         const ev = buildDMEvent(text, identity.privkeyHex, peerPubkey);
-        publishEvent(ev);
+        await publishEvent(ev);
         const msg = { id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'text', text, ts: ev.created_at * 1000, mine: true, reactions: {} };
         await cacheMessage(msg);
         setMessages(prev => [...prev, msg]);
@@ -420,7 +549,7 @@ export default function ChatPage() {
   }, [input, peerPubkey, sending, identity, requestStates, editingMsg, replyTo]);
 
   const handleKeyDown = e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); isGroup ? handleGroupSend() : handleSend(); }
     if (e.key === 'Escape') { setEditingMsg(null); setReplyTo(null); setInput(''); }
   };
 
@@ -432,7 +561,7 @@ export default function ChatPage() {
       const { b64, mimeType } = await compressImageToBase64(file);
       const payload = { type: 'media', mediaType: 'image', data: b64, mimeType, fileName: file.name };
       const ev = buildMediaDMEvent(payload, identity.privkeyHex, peerPubkey);
-      publishEvent(ev);
+      await publishEvent(ev);
       const msg = { id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'media', mediaType: 'image', data: b64, mimeType, fileName: file.name, ts: ev.created_at * 1000, mine: true, reactions: {} };
       await cacheMessage(msg);
       setMessages(prev => [...prev, msg]);
@@ -469,7 +598,7 @@ export default function ChatPage() {
           const { b64, mimeType } = await audioBlobToBase64(blob);
           const payload = { type: 'media', mediaType: 'audio', data: b64, mimeType, fileName: 'voice.webm' };
           const ev = buildMediaDMEvent(payload, identity.privkeyHex, peerPubkey);
-          publishEvent(ev);
+          await publishEvent(ev);
           const msg = { id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'media', mediaType: 'audio', data: b64, mimeType, fileName: 'voice.webm', ts: ev.created_at * 1000, mine: true, reactions: {} };
           await cacheMessage(msg);
           setMessages(prev => [...prev, msg]);
@@ -496,7 +625,7 @@ export default function ChatPage() {
     if (!peerPubkey || !identity) return;
     setEmojiPickerMsg(null); setMenuMsg(null);
     const ev = buildReactionEvent(msgId, emoji, identity.privkeyHex, peerPubkey);
-    publishEvent(ev);
+    await publishEvent(ev);
     await cacheMessage({ id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'reaction', targetId: msgId, emoji, ts: ev.created_at * 1000, mine: true });
     setMessages(prev => prev.map(m => {
       if (m.id !== msgId) return m;
@@ -512,7 +641,7 @@ export default function ChatPage() {
     setMenuMsg(null);
     if (!confirm('Delete this message?')) return;
     const ev = buildDeleteEvent(msg.id, identity.privkeyHex, peerPubkey);
-    publishEvent(ev);
+    await publishEvent(ev);
     await cacheMessage({ id: ev.id, peer: peerPubkey, from: identity.pubkeyHex, msgType: 'delete', targetId: msg.id, ts: ev.created_at * 1000, mine: true });
     setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, deleted: true } : m));
   };
@@ -530,7 +659,7 @@ export default function ChatPage() {
     try {
       const contact = await saveContact(pk, addName.trim());
       setContacts(prev => ({ ...prev, [pk]: contact }));
-      publishEvent(buildRequestEvent(identity.privkeyHex, pk, identity.displayName));
+      await publishEvent(buildRequestEvent(identity.privkeyHex, pk, identity.displayName));
       await setRequestState(pk, 'pending_sent');
       setRequestStates(await getAllRequestStates());
       setShowAdd(false);
@@ -543,14 +672,14 @@ export default function ChatPage() {
   const handleAccept = async (fromPubkey, displayName) => {
     const contact = await saveContact(fromPubkey, displayName);
     setContacts(prev => ({ ...prev, [fromPubkey]: contact }));
-    publishEvent(buildAcceptEvent(identity.privkeyHex, fromPubkey));
+    await publishEvent(buildAcceptEvent(identity.privkeyHex, fromPubkey));
     await setRequestState(fromPubkey, 'accepted');
     setRequestStates(await getAllRequestStates());
     setIncomingRequests(prev => prev.filter(r => r.fromPubkey !== fromPubkey));
     router.push(`/chat/${fromPubkey}`);
   };
   const handleDecline = async fromPubkey => {
-    publishEvent(buildDeclineEvent(identity.privkeyHex, fromPubkey));
+    await publishEvent(buildDeclineEvent(identity.privkeyHex, fromPubkey));
     await setRequestState(fromPubkey, 'declined');
     setRequestStates(await getAllRequestStates());
     setIncomingRequests(prev => prev.filter(r => r.fromPubkey !== fromPubkey));
@@ -560,6 +689,18 @@ export default function ChatPage() {
     setContacts(prev => { const n = { ...prev }; delete n[pk]; return n; });
     if (peerPubkey === pk) router.push('/chat/_');
   };
+
+  /* ─── save display name ─── */
+  const saveDisplayName = useCallback(async () => {
+    if (!nameInput.trim() || nameSaving) return;
+    setNameSaving(true);
+    try {
+      await updateDisplayName(nameInput.trim());
+      setNameSaved(true);
+      setTimeout(() => { setEditingName(false); setNameSaved(false); }, 900);
+    } catch (err) { console.error('Failed to save name', err); }
+    finally { setNameSaving(false); }
+  }, [nameInput, nameSaving, updateDisplayName]);
 
   /* ─── helpers ─── */
   const copy = async (text, label) => {
@@ -722,9 +863,57 @@ export default function ChatPage() {
 
               {/* Identity */}
               <p style={{ color:'rgba(255,255,255,.2)', fontSize:10, fontWeight:700, letterSpacing:'.12em', textTransform:'uppercase', marginBottom:10 }}>Identity</p>
+
+              {/* ── Display name — editable ── */}
               <div style={{ background:'rgba(255,255,255,.03)', border:'1px solid rgba(255,255,255,.06)', borderRadius:10, padding:'11px 13px', marginBottom:8 }}>
-                <p style={{ color:'rgba(255,255,255,.3)', fontSize:11, marginBottom:3 }}>Display name</p>
-                <p style={{ color:'rgba(255,255,255,.85)', fontSize:14, fontWeight:500 }}>{identity.displayName}</p>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom: editingName ? 8 : 0 }}>
+                  <p style={{ color:'rgba(255,255,255,.3)', fontSize:11 }}>Display name</p>
+                  {!editingName && (
+                    <button
+                      onClick={() => { setNameInput(identity.displayName || ''); setEditingName(true); setNameSaved(false); }}
+                      style={{ padding:'3px 9px', borderRadius:6, background:'rgba(99,102,241,.1)', border:'1px solid rgba(99,102,241,.2)', color:'rgba(139,92,246,.85)', fontSize:11, display:'flex', alignItems:'center', gap:5, transition:'all .15s' }}
+                      onMouseEnter={e=>{ e.currentTarget.style.background='rgba(99,102,241,.18)'; }}
+                      onMouseLeave={e=>{ e.currentTarget.style.background='rgba(99,102,241,.1)'; }}>
+                      <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M8.5 1.5l2 2L4 10H2V8L8.5 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/></svg>
+                      Edit
+                    </button>
+                  )}
+                </div>
+                {editingName ? (
+                  <div>
+                    <div style={{ position:'relative', marginBottom:8 }}>
+                      <input
+                        autoFocus
+                        value={nameInput}
+                        onChange={e => setNameInput(e.target.value.slice(0, 32))}
+                        onKeyDown={async e => {
+                          if (e.key === 'Enter') { e.preventDefault(); await saveDisplayName(); }
+                          if (e.key === 'Escape') setEditingName(false);
+                        }}
+                        placeholder="Your display name"
+                        style={{ width:'100%', background:'rgba(255,255,255,.05)', border:'1.5px solid rgba(99,102,241,.4)', borderRadius:8, padding:'8px 36px 8px 10px', color:'rgba(255,255,255,.9)', fontSize:13.5, boxShadow:'0 0 0 3px rgba(99,102,241,.1)' }}
+                      />
+                      <span style={{ position:'absolute', right:10, top:'50%', transform:'translateY(-50%)', color:'rgba(255,255,255,.2)', fontSize:10 }}>{32 - nameInput.length}</span>
+                    </div>
+                    <div style={{ display:'flex', gap:7 }}>
+                      <button
+                        onClick={saveDisplayName}
+                        disabled={nameSaving || !nameInput.trim()}
+                        style={{ flex:1, padding:'7px', borderRadius:8, background: nameInput.trim() && !nameSaving ? 'linear-gradient(135deg,#6366f1,#7c3aed)' : 'rgba(255,255,255,.06)', color: nameInput.trim() && !nameSaving ? '#fff' : 'rgba(255,255,255,.25)', fontSize:12, fontWeight:600, display:'flex', alignItems:'center', justifyContent:'center', gap:6, boxShadow: nameInput.trim() && !nameSaving ? '0 3px 12px rgba(99,102,241,.3)' : 'none', transition:'all .15s' }}>
+                        {nameSaving
+                          ? <><div style={{ width:10, height:10, border:'1.5px solid rgba(255,255,255,.2)', borderTop:'1.5px solid #fff', borderRadius:'50%', animation:'spin .7s linear infinite' }}/>Saving…</>
+                          : nameSaved ? '✓ Saved!' : 'Save name'}
+                      </button>
+                      <button
+                        onClick={() => setEditingName(false)}
+                        style={{ padding:'7px 12px', borderRadius:8, background:'rgba(255,255,255,.04)', border:'1px solid rgba(255,255,255,.07)', color:'rgba(255,255,255,.35)', fontSize:12 }}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <p style={{ color:'rgba(255,255,255,.85)', fontSize:14, fontWeight:500, marginTop:3 }}>{identity.displayName}</p>
+                )}
               </div>
               <div style={{ background:'rgba(255,255,255,.03)', border:'1px solid rgba(255,255,255,.06)', borderRadius:10, padding:'11px 13px', marginBottom:8 }}>
                 <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', gap:10 }}>
@@ -789,6 +978,79 @@ export default function ChatPage() {
           />
         )}
 
+        {/* ══════════ NEW GROUP MODAL ══════════ */}
+        {showNewGroup && (
+          <div className="modal-bg" onClick={() => setShowNewGroup(false)}
+            style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.75)', backdropFilter:'blur(12px)', zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <div className="modal-card" onClick={e => e.stopPropagation()}
+              style={{ width:460, background:'linear-gradient(145deg,#141416,#0f0f11)', border:'1px solid rgba(255,255,255,.09)', borderRadius:20, padding:28, boxShadow:'0 40px 80px rgba(0,0,0,.8)' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:6 }}>
+                <div style={{ width:38, height:38, borderRadius:12, background:'rgba(99,102,241,.12)', border:'1px solid rgba(99,102,241,.2)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                  <svg width="16" height="16" viewBox="0 0 18 18" fill="none"><path d="M1 14c0-2.76 2.239-5 5-5s5 2.24 5 5M6 9a3 3 0 100-6 3 3 0 000 6z" stroke="#a78bfa" strokeWidth="1.4" strokeLinecap="round"/><path d="M12 5a3 3 0 010 6M17 14c0-2.21-1.79-4-4-4" stroke="#a78bfa" strokeWidth="1.4" strokeLinecap="round"/></svg>
+                </div>
+                <div>
+                  <h2 style={{ color:'rgba(255,255,255,.92)', fontSize:16, fontWeight:600 }}>New group chat</h2>
+                  <p style={{ color:'rgba(255,255,255,.28)', fontSize:12, marginTop:1 }}>Messages are end-to-end encrypted with a shared key</p>
+                </div>
+              </div>
+              <div style={{ height:1, background:'linear-gradient(90deg,transparent,rgba(255,255,255,.07),transparent)', margin:'18px 0' }}/>
+              <form onSubmit={handleCreateGroup}>
+                <label style={{ display:'block', color:'rgba(255,255,255,.3)', fontSize:10.5, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', marginBottom:7 }}>Group name</label>
+                <input autoFocus value={groupName} onChange={e => setGroupName(e.target.value.slice(0,40))} placeholder="e.g. Team, Family, Friends"
+                  style={{ width:'100%', background:'rgba(255,255,255,.04)', border:'1.5px solid rgba(255,255,255,.08)', borderRadius:10, padding:'11px 14px', color:'rgba(255,255,255,.85)', fontSize:13.5, marginBottom:16, transition:'border-color .2s' }}
+                  onFocus={e => e.target.style.borderColor='rgba(99,102,241,.5)'} onBlur={e => e.target.style.borderColor='rgba(255,255,255,.08)'}/>
+                <label style={{ display:'block', color:'rgba(255,255,255,.3)', fontSize:10.5, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', marginBottom:7 }}>Add members</label>
+                <div style={{ display:'flex', gap:8, marginBottom:8 }}>
+                  <input value={groupMemberInput} onChange={e => { setGroupMemberInput(e.target.value); setGroupMemberError(''); }} placeholder="npub1… or hex pubkey"
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addGroupMember(); } }}
+                    style={{ flex:1, background:'rgba(255,255,255,.04)', border:`1.5px solid ${groupMemberError?'rgba(239,68,68,.5)':'rgba(255,255,255,.08)'}`, borderRadius:10, padding:'10px 14px', color:'rgba(255,255,255,.85)', fontSize:12, fontFamily:"'DM Mono',monospace", transition:'border-color .2s' }}
+                    onFocus={e => e.target.style.borderColor='rgba(99,102,241,.5)'} onBlur={e => e.target.style.borderColor=groupMemberError?'rgba(239,68,68,.5)':'rgba(255,255,255,.08)'}/>
+                  <button type="button" onClick={addGroupMember} className="pill" style={{ padding:'10px 16px', borderRadius:9, background:'rgba(99,102,241,.1)', border:'1px solid rgba(99,102,241,.2)', color:'rgba(139,92,246,.85)', fontSize:12, fontWeight:600 }}>Add</button>
+                </div>
+                {groupMemberError && <p style={{ color:'#f87171', fontSize:11.5, marginBottom:8 }}>{groupMemberError}</p>}
+                {/* Also allow picking from contacts */}
+                {Object.values(contacts).length > 0 && (
+                  <div style={{ marginBottom:12 }}>
+                    <p style={{ color:'rgba(255,255,255,.2)', fontSize:11, marginBottom:6 }}>Or pick from contacts:</p>
+                    <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
+                      {Object.values(contacts).filter(c => !groupMembers.find(m => m.pubkeyHex === c.pubkeyHex)).map(c => (
+                        <button key={c.pubkeyHex} type="button" onClick={() => setGroupMembers(prev => [...prev, { pubkeyHex: c.pubkeyHex, displayName: c.displayName }])}
+                          style={{ padding:'5px 11px', borderRadius:20, background:'rgba(255,255,255,.05)', border:'1px solid rgba(255,255,255,.09)', color:'rgba(255,255,255,.55)', fontSize:11.5, display:'flex', alignItems:'center', gap:5 }}
+                          onMouseEnter={e=>e.currentTarget.style.background='rgba(99,102,241,.1)'} onMouseLeave={e=>e.currentTarget.style.background='rgba(255,255,255,.05)'}>
+                          <div style={{ width:16, height:16, borderRadius:5, background:avatarGrad(c.pubkeyHex), display:'flex', alignItems:'center', justifyContent:'center', fontSize:8, fontWeight:700, color:'#fff' }}>{c.displayName?.[0]?.toUpperCase()}</div>
+                          {c.displayName}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {/* Selected members */}
+                {groupMembers.length > 0 && (
+                  <div style={{ marginBottom:16 }}>
+                    <p style={{ color:'rgba(255,255,255,.25)', fontSize:11, marginBottom:6 }}>Members ({groupMembers.length + 1} including you):</p>
+                    <div style={{ display:'flex', flexWrap:'wrap', gap:5 }}>
+                      {groupMembers.map(m => (
+                        <div key={m.pubkeyHex} style={{ display:'flex', alignItems:'center', gap:5, padding:'4px 9px', background:'rgba(99,102,241,.1)', border:'1px solid rgba(99,102,241,.2)', borderRadius:20 }}>
+                          <div style={{ width:14, height:14, borderRadius:4, background:avatarGrad(m.pubkeyHex), display:'flex', alignItems:'center', justifyContent:'center', fontSize:7, fontWeight:700, color:'#fff' }}>{m.displayName?.[0]?.toUpperCase()}</div>
+                          <span style={{ color:'rgba(139,92,246,.9)', fontSize:11.5 }}>{m.displayName}</span>
+                          <button type="button" onClick={() => setGroupMembers(prev => prev.filter(x => x.pubkeyHex !== m.pubkeyHex))} style={{ color:'rgba(139,92,246,.5)', fontSize:14, lineHeight:1, marginLeft:1 }}>×</button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
+                  <button type="button" onClick={() => { setShowNewGroup(false); setGroupName(''); setGroupMembers([]); setGroupMemberInput(''); setGroupMemberError(''); }} className="pill" style={{ padding:'10px 18px', borderRadius:9, color:'rgba(255,255,255,.4)', fontSize:13, background:'rgba(255,255,255,.04)', border:'1px solid rgba(255,255,255,.07)' }}>Cancel</button>
+                  <button type="submit" disabled={groupCreating || !groupName.trim() || groupMembers.length === 0} className="pill"
+                    style={{ padding:'10px 22px', borderRadius:9, fontSize:13, fontWeight:600, display:'flex', alignItems:'center', gap:7, background:groupName.trim()&&groupMembers.length>0&&!groupCreating?'linear-gradient(135deg,#6366f1,#8b5cf6)':'rgba(255,255,255,.06)', color:groupName.trim()&&groupMembers.length>0&&!groupCreating?'#fff':'rgba(255,255,255,.25)', boxShadow:groupName.trim()&&groupMembers.length>0&&!groupCreating?'0 4px 16px rgba(99,102,241,.35)':'none', transition:'all .2s' }}>
+                    {groupCreating ? <><div style={{ width:11, height:11, border:'1.5px solid rgba(255,255,255,.2)', borderTop:'1.5px solid #fff', borderRadius:'50%', animation:'spin .7s linear infinite' }}/>Creating…</> : 'Create group'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
         {/* ══════════ SIDEBAR ══════════ */}
         <div className={`sidebar-panel${sidebarOpen ? ' sidebar-open' : ''}`} style={{ width:260, flexShrink:0, display:'flex', flexDirection:'column', background:'#0b0b0d', borderRight:'1px solid rgba(255,255,255,.05)', position:'relative', zIndex:1 }}>
 
@@ -803,7 +1065,7 @@ export default function ChatPage() {
               </div>
               <div style={{ display:'flex', gap:2, alignItems:'center' }}>
                 {incomingRequests.length > 0 && <div style={{ width:7, height:7, borderRadius:'50%', background:'#f59e0b', marginRight:2, boxShadow:'0 0 6px #f59e0b', animation:'glow 2s ease infinite' }}/>}
-                {[{icon:Icon.plus,action:()=>setShowAdd(true),title:'New conversation'},{icon:Icon.settings,action:()=>setShowSettings(true),title:'Settings'}].map((btn,i) => (
+                {[{icon:Icon.plus,action:()=>setShowAdd(true),title:'New conversation'},{icon:<svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M1 12c0-2.21 1.79-4 4-4s4 1.79 4 4M5 8a3 3 0 100-6 3 3 0 000 6z" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/><path d="M10 4a3 3 0 010 6M15 12c0-1.66-1.34-3-3-3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>,action:()=>setShowNewGroup(true),title:'New group'},{icon:Icon.settings,action:()=>setShowSettings(true),title:'Settings'}].map((btn,i) => (
                   <button key={i} onClick={btn.action} title={btn.title}
                     style={{ width:28, height:28, borderRadius:7, display:'flex', alignItems:'center', justifyContent:'center', color:'rgba(255,255,255,.32)', transition:'all .15s' }}
                     onMouseEnter={e=>{e.currentTarget.style.background='rgba(255,255,255,.07)';e.currentTarget.style.color='rgba(255,255,255,.75)';}}
@@ -839,6 +1101,37 @@ export default function ChatPage() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Groups section */}
+          {groups.length > 0 && (
+            <div style={{ borderBottom:'1px solid rgba(255,255,255,.04)', paddingBottom:4 }}>
+              <div style={{ padding:'8px 14px 4px', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                <span style={{ color:'rgba(255,255,255,.2)', fontSize:10, fontWeight:700, letterSpacing:'.1em', textTransform:'uppercase' }}>Groups</span>
+                <button onClick={() => setShowNewGroup(true)} style={{ color:'rgba(255,255,255,.25)', fontSize:16, lineHeight:1 }} onMouseEnter={e=>e.currentTarget.style.color='rgba(139,92,246,.8)'} onMouseLeave={e=>e.currentTarget.style.color='rgba(255,255,255,.25)'}>+</button>
+              </div>
+              {groups.filter(g => !search || g.name?.toLowerCase().includes(search.toLowerCase())).map(g => {
+                const active = g.groupId === groupId;
+                return (
+                  <div key={g.groupId} className="contact-row"
+                    style={{ position:'relative', background:active?'rgba(99,102,241,.08)':'transparent', borderLeft:`2px solid ${active?'rgba(99,102,241,.6)':'transparent'}`, transition:'all .12s' }}>
+                    <button onClick={() => router.push(`/chat/${g.groupId}`)}
+                      style={{ width:'100%', display:'flex', alignItems:'center', gap:10, padding:'9px 12px 9px 10px', textAlign:'left' }}>
+                      <div style={{ width:36, height:36, borderRadius:11, background:active?avatarGrad(g.groupId):'rgba(255,255,255,.07)', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, fontSize:12, fontWeight:700, color:active?'#fff':'rgba(255,255,255,.35)', transition:'all .2s', position:'relative' }}>
+                        {g.name?.[0]?.toUpperCase()}
+                        <div style={{ position:'absolute', bottom:-2, right:-2, width:12, height:12, borderRadius:'50%', background:'rgba(99,102,241,.9)', border:'2px solid #0b0b0d', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                          <svg width="6" height="6" viewBox="0 0 8 8" fill="none"><path d="M1 6c0-1.66 1.34-3 3-3s3 1.34 3 3M4 3a1.5 1.5 0 100-3 1.5 1.5 0 000 3z" stroke="white" strokeWidth="1" strokeLinecap="round"/></svg>
+                        </div>
+                      </div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <p style={{ color:active?'rgba(255,255,255,.92)':'rgba(255,255,255,.62)', fontSize:13.5, fontWeight:active?500:400, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{g.name}</p>
+                        <p style={{ color:'rgba(255,255,255,.2)', fontSize:10.5 }}>{g.members?.length || 0} members</p>
+                      </div>
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -879,8 +1172,25 @@ export default function ChatPage() {
             })}
           </div>
 
+          {/* New group button if no groups yet */}
+          {groups.length === 0 && (
+            <div style={{ padding:'4px 8px 8px' }}>
+              <button onClick={() => setShowNewGroup(true)}
+                style={{ width:'100%', padding:'8px 12px', borderRadius:10, background:'rgba(255,255,255,.025)', border:'1px dashed rgba(255,255,255,.08)', color:'rgba(255,255,255,.3)', fontSize:12, display:'flex', alignItems:'center', gap:7, transition:'all .15s' }}
+                onMouseEnter={e=>{e.currentTarget.style.background='rgba(99,102,241,.06)';e.currentTarget.style.borderColor='rgba(99,102,241,.2)';e.currentTarget.style.color='rgba(139,92,246,.7)';}} onMouseLeave={e=>{e.currentTarget.style.background='rgba(255,255,255,.025)';e.currentTarget.style.borderColor='rgba(255,255,255,.08)';e.currentTarget.style.color='rgba(255,255,255,.3)';}}>
+                <svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M7 2v10M2 7h10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+                New group chat
+              </button>
+            </div>
+          )}
+
           {/* Footer */}
-          <div style={{ padding:'10px 12px', borderTop:'1px solid rgba(255,255,255,.04)', display:'flex', alignItems:'center', gap:9 }}>
+          <div
+            style={{ padding:'10px 12px', borderTop:'1px solid rgba(255,255,255,.04)', display:'flex', alignItems:'center', gap:9, cursor:'pointer', transition:'background .15s', borderRadius:'0 0 0 0' }}
+            onClick={() => setShowSettings(true)}
+            title="Open settings"
+            onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,.03)'}
+            onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
             <div style={{ width:30, height:30, borderRadius:9, background:avatarGrad(identity.pubkeyHex), display:'flex', alignItems:'center', justifyContent:'center', fontSize:12, fontWeight:700, color:'#fff', flexShrink:0 }}>{identity.displayName?.[0]?.toUpperCase()}</div>
             <div style={{ flex:1, minWidth:0 }}><p style={{ color:'rgba(255,255,255,.55)', fontSize:12.5, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', fontWeight:500 }}>{identity.displayName}</p></div>
             <div style={{ display:'flex', alignItems:'center', gap:5 }}>
@@ -891,7 +1201,7 @@ export default function ChatPage() {
         </div>
 
         {/* ══════════ MAIN AREA ══════════ */}
-        {!peerPubkey ? (
+        {!peerPubkey && !isGroup ? (
           <div style={{ flex:1, display:'flex', flexDirection:'column', background:'#080809', position:'relative', zIndex:1, minWidth:0 }}>
             {/* Mobile top bar - empty state */}
             <div className="mobile-topbar" style={{ padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,.05)', display:'none', alignItems:'center', gap:12, flexShrink:0, background:'rgba(8,8,9,.95)', backdropFilter:'blur(20px)' }}>
@@ -918,7 +1228,233 @@ export default function ChatPage() {
             </div>
             </div>
           </div>
-        ) : (
+        ) : isGroup ? (
+          /* ══════════ GROUP CHAT MAIN AREA ══════════ */
+          <div style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0, background:'#080809', position:'relative', zIndex:1 }}
+            onClick={() => { setMenuMsg(null); setEmojiPickerMsg(null); }}>
+
+            {/* Group header */}
+            <div style={{ padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,.05)', display:'flex', alignItems:'center', gap:10, flexShrink:0, background:'rgba(8,8,9,.9)', backdropFilter:'blur(20px)' }}>
+              <button onClick={(e) => { e.stopPropagation(); setSidebarOpen(true); }} className="mobile-menu-btn" style={{ width:34, height:34, borderRadius:10, display:'none', alignItems:'center', justifyContent:'center', color:'rgba(255,255,255,.45)', background:'rgba(255,255,255,.05)', border:'1px solid rgba(255,255,255,.07)', flexShrink:0 }}>
+                <svg width="16" height="16" viewBox="0 0 18 18" fill="none"><path d="M2 4.5h14M2 9h14M2 13.5h14" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+              </button>
+              {/* Group avatar */}
+              <div style={{ width:38, height:38, borderRadius:12, background:avatarGrad(groupId||''), display:'flex', alignItems:'center', justifyContent:'center', fontSize:15, fontWeight:700, color:'#fff', boxShadow:'0 4px 12px rgba(0,0,0,.3)', flexShrink:0, position:'relative' }}>
+                {currentGroup?.name?.[0]?.toUpperCase() || '#'}
+                <div style={{ position:'absolute', bottom:-3, right:-3, width:14, height:14, borderRadius:'50%', background:'rgba(99,102,241,.9)', border:'2.5px solid #080809', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                  <svg width="7" height="7" viewBox="0 0 8 8" fill="none"><path d="M1 6.5c0-1.66 1.34-3 3-3s3 1.34 3 3M4 3.5a1.5 1.5 0 100-3 1.5 1.5 0 000 3z" stroke="white" strokeWidth="1" strokeLinecap="round"/></svg>
+                </div>
+              </div>
+              <div style={{ flex:1, minWidth:0 }}>
+                <p style={{ color:'rgba(255,255,255,.88)', fontSize:14.5, fontWeight:600 }}>{currentGroup?.name || 'Group'}</p>
+                {/* Member mini-avatars */}
+                <div style={{ display:'flex', alignItems:'center', gap:3, marginTop:3 }}>
+                  {(currentGroup?.members||[]).slice(0,5).map(m => (
+                    <div key={m} style={{ width:14, height:14, borderRadius:4, background:avatarGrad(m), display:'flex', alignItems:'center', justifyContent:'center', fontSize:6, fontWeight:700, color:'#fff', border:'1px solid #080809' }}>
+                      {(contacts[m]?.displayName?.[0] || m[0]).toUpperCase()}
+                    </div>
+                  ))}
+                  {(currentGroup?.members||[]).length > 5 && <span style={{ color:'rgba(255,255,255,.25)', fontSize:10 }}>+{currentGroup.members.length - 5}</span>}
+                  <span style={{ color:'rgba(255,255,255,.2)', fontSize:10, marginLeft:3 }}>{currentGroup?.members?.length || 0} members</span>
+                </div>
+              </div>
+              <button onClick={e => { e.stopPropagation(); setShowGroupInfo(v => !v); }}
+                style={{ width:34, height:34, borderRadius:10, background:showGroupInfo?'rgba(99,102,241,.15)':'rgba(255,255,255,.05)', border:`1px solid ${showGroupInfo?'rgba(99,102,241,.3)':'rgba(255,255,255,.08)'}`, display:'flex', alignItems:'center', justifyContent:'center', color:showGroupInfo?'#a78bfa':'rgba(255,255,255,.45)', flexShrink:0, transition:'all .15s' }}>
+                {Icon.settings}
+              </button>
+              <div className="enc-badge" style={{ display:'flex', alignItems:'center', gap:6, padding:'5px 10px', background:'rgba(52,211,153,.05)', border:'1px solid rgba(52,211,153,.1)', borderRadius:20 }}>
+                {Icon.lock}
+                <span style={{ color:'rgba(52,211,153,.65)', fontSize:10.5, fontWeight:500 }}>Encrypted</span>
+              </div>
+            </div>
+
+            <div style={{ flex:1, display:'flex', minHeight:0 }}>
+              {/* Messages */}
+              <div className="messages-area" style={{ flex:1, overflowY:'auto', padding:'16px 24px 8px', display:'flex', flexDirection:'column' }}>
+                {loadingMsgs ? (
+                  <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:14 }}>
+                    <div style={{ display:'flex', gap:6 }}>{[0,1,2].map(i => <div key={i} style={{ width:8, height:8, borderRadius:'50%', background:'rgba(99,102,241,.5)', animation:`dotBounce 1.4s ease-in-out ${i*.2}s infinite` }}/>)}</div>
+                    <p style={{ color:'rgba(255,255,255,.2)', fontSize:12 }}>Loading group messages…</p>
+                  </div>
+                ) : messages.length === 0 ? (
+                  <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:10 }}>
+                    <div style={{ width:56, height:56, borderRadius:18, background:avatarGrad(groupId||''), display:'flex', alignItems:'center', justifyContent:'center', fontSize:22, fontWeight:700, color:'#fff', boxShadow:'0 8px 28px rgba(0,0,0,.4)', animation:'floatY 5s ease-in-out infinite' }}>{currentGroup?.name?.[0]?.toUpperCase()||'#'}</div>
+                    <p style={{ color:'rgba(255,255,255,.35)', fontSize:14, fontWeight:500 }}>Start the conversation in {currentGroup?.name}</p>
+                    <p style={{ color:'rgba(255,255,255,.12)', fontSize:11.5 }}>AES-256-GCM · End-to-end encrypted</p>
+                  </div>
+                ) : (
+                  <div style={{ display:'flex', flexDirection:'column', gap:1 }}>
+                    {messages.map((msg, i) => {
+                      const prev = messages[i-1], next = messages[i+1];
+                      const isLast  = !next || next.from !== msg.from;
+                      const isFirst = !prev || prev.from !== msg.from;
+                      const showDate = i===0 || new Date(msg.ts).toDateString() !== new Date(messages[i-1].ts).toDateString();
+                      const senderName = msg.mine ? 'You' : (contacts[msg.from]?.displayName || msg.from?.slice(0,12));
+                      const audioSrc = msg.msgType==='media'&&msg.mediaType==='audio' ? `data:${msg.mimeType||'audio/webm'};base64,${msg.data}` : null;
+                      return (
+                        <div key={msg.id}>
+                          {showDate && (
+                            <div style={{ display:'flex', alignItems:'center', gap:10, margin:'16px 0 10px' }}>
+                              <div style={{ flex:1, height:1, background:'rgba(255,255,255,.05)' }}/>
+                              <span style={{ color:'rgba(255,255,255,.18)', fontSize:10.5, fontWeight:500 }}>{new Date(msg.ts).toLocaleDateString([],{weekday:'short',month:'short',day:'numeric'})}</span>
+                              <div style={{ flex:1, height:1, background:'rgba(255,255,255,.05)' }}/>
+                            </div>
+                          )}
+                          <div style={{ display:'flex', justifyContent:msg.mine?'flex-end':'flex-start', marginTop:isFirst&&i>0&&!showDate?12:2, paddingBottom:isLast?4:1, alignItems:'flex-end', gap:8 }}>
+                            {!msg.mine && (
+                              <div style={{ width:28, flexShrink:0, alignSelf:'flex-end' }}>
+                                {isLast && <div style={{ width:26, height:26, borderRadius:8, background:avatarGrad(msg.from), display:'flex', alignItems:'center', justifyContent:'center', fontSize:9, fontWeight:700, color:'#fff' }} title={senderName}>{senderName[0]?.toUpperCase()}</div>}
+                              </div>
+                            )}
+                            <div style={{ maxWidth:'60%' }}>
+                              {isFirst && !msg.mine && <p style={{ color:'rgba(255,255,255,.3)', fontSize:10.5, fontWeight:600, marginBottom:3, paddingLeft:2 }}>{senderName}</p>}
+                              <div style={{
+                                padding: audioSrc ? 0 : (msg.msgType==='media'&&msg.mediaType==='image') ? '4px' : '10px 14px',
+                                borderRadius:16,
+                                borderBottomRightRadius: msg.mine ? (isLast?5:16) : 16,
+                                borderBottomLeftRadius: !msg.mine ? (isLast?5:16) : 16,
+                                background: msg.mine ? 'linear-gradient(135deg,#6366f1,#7c3aed)' : 'rgba(255,255,255,.07)',
+                                border: msg.mine ? 'none' : '1px solid rgba(255,255,255,.08)',
+                                boxShadow: msg.mine ? '0 4px 16px rgba(99,102,241,.25)' : 'none',
+                                overflow:'hidden',
+                              }}>
+                                {audioSrc ? (
+                                  <AudioPlayer src={audioSrc} isMine={msg.mine} />
+                                ) : msg.msgType==='media' && msg.mediaType==='image' ? (
+                                  <img src={`data:${msg.mimeType||'image/jpeg'};base64,${msg.data}`} alt=""
+                                    style={{ maxWidth:'100%', maxHeight:220, borderRadius:13, display:'block', cursor:'pointer', objectFit:'cover' }}
+                                    onClick={() => setLightboxSrc(`data:${msg.mimeType||'image/jpeg'};base64,${msg.data}`)}/>
+                                ) : (
+                                  <p style={{ fontSize:13.5, lineHeight:1.55, color:msg.mine?'rgba(255,255,255,.92)':'rgba(255,255,255,.82)', wordBreak:'break-word', whiteSpace:'pre-wrap' }}>{msg.text}</p>
+                                )}
+                              </div>
+                              {isLast && <p style={{ fontSize:10, color:'rgba(255,255,255,.18)', marginTop:4, textAlign:msg.mine?'right':'left' }}>{fmtTime(msg.ts)}</p>}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div ref={bottomRef}/>
+                  </div>
+                )}
+              </div>
+
+              {/* Group info panel */}
+              {showGroupInfo && currentGroup && (
+                <div style={{ width:220, flexShrink:0, borderLeft:'1px solid rgba(255,255,255,.05)', background:'rgba(8,8,9,.8)', overflowY:'auto', padding:'16px 14px' }}>
+                  <p style={{ color:'rgba(255,255,255,.2)', fontSize:10, fontWeight:700, letterSpacing:'.1em', textTransform:'uppercase', marginBottom:12 }}>Group Info</p>
+                  <div style={{ width:52, height:52, borderRadius:16, background:avatarGrad(currentGroup.groupId), display:'flex', alignItems:'center', justifyContent:'center', fontSize:20, fontWeight:700, color:'#fff', margin:'0 auto 10px', boxShadow:'0 4px 16px rgba(0,0,0,.4)' }}>{currentGroup.name?.[0]?.toUpperCase()}</div>
+                  <p style={{ color:'rgba(255,255,255,.75)', fontSize:14, fontWeight:600, textAlign:'center', marginBottom:4 }}>{currentGroup.name}</p>
+                  <p style={{ color:'rgba(255,255,255,.2)', fontSize:11, textAlign:'center', marginBottom:18 }}>Created {new Date(currentGroup.createdAt).toLocaleDateString()}</p>
+                  <p style={{ color:'rgba(255,255,255,.2)', fontSize:10, fontWeight:700, letterSpacing:'.08em', textTransform:'uppercase', marginBottom:8 }}>Members</p>
+                  {currentGroup.members.map(m => (
+                    <div key={m} style={{ display:'flex', alignItems:'center', gap:8, padding:'6px 0', borderBottom:'1px solid rgba(255,255,255,.04)' }}>
+                      <div style={{ width:28, height:28, borderRadius:8, background:avatarGrad(m), display:'flex', alignItems:'center', justifyContent:'center', fontSize:10, fontWeight:700, color:'#fff', flexShrink:0 }}>{(contacts[m]?.displayName?.[0] || m[0])?.toUpperCase()}</div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <p style={{ color:'rgba(255,255,255,.65)', fontSize:12, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{m === identity.pubkeyHex ? 'You' : (contacts[m]?.displayName || m.slice(0,12))}</p>
+                        {m === currentGroup.createdBy && <p style={{ color:'rgba(99,102,241,.6)', fontSize:9.5 }}>Admin</p>}
+                      </div>
+                    </div>
+                  ))}
+                  {/* Add member */}
+                  {currentGroup.createdBy === identity.pubkeyHex && (
+                    <div style={{ marginTop:14 }}>
+                      <p style={{ color:'rgba(255,255,255,.2)', fontSize:10, fontWeight:700, letterSpacing:'.08em', textTransform:'uppercase', marginBottom:8 }}>Add member</p>
+                      <input value={addMemberInput} onChange={e => { setAddMemberInput(e.target.value); setAddMemberError(''); }} placeholder="npub1… or hex"
+                        style={{ width:'100%', background:'rgba(255,255,255,.04)', border:`1.5px solid ${addMemberError?'rgba(239,68,68,.4)':'rgba(255,255,255,.08)'}`, borderRadius:9, padding:'8px 10px', color:'rgba(255,255,255,.75)', fontSize:11.5, fontFamily:"'DM Mono',monospace", marginBottom:6 }}
+                        onFocus={e=>e.target.style.borderColor='rgba(99,102,241,.4)'} onBlur={e=>e.target.style.borderColor=addMemberError?'rgba(239,68,68,.4)':'rgba(255,255,255,.08)'}
+                        onKeyDown={async e => {
+                          if (e.key !== 'Enter') return;
+                          const raw = addMemberInput.trim();
+                          let pk = isValidNpub(raw) ? npubToPubkeyHex(raw) : isValidPubkeyHex(raw) ? raw.toLowerCase() : null;
+                          if (!pk) { setAddMemberError('Invalid key'); return; }
+                          if (currentGroup.members.includes(pk)) { setAddMemberError('Already a member'); return; }
+                          const updated = { ...currentGroup, members: [...currentGroup.members, pk] };
+                          await saveGroup(updated); setCurrentGroup(updated);
+                          setGroups(prev => prev.map(g => g.groupId === updated.groupId ? updated : g));
+
+                          // Re-invite ALL members (including the new one) so everyone has the updated member list
+                          for (const mHex of updated.members) {
+                            if (mHex === identity.pubkeyHex) continue; // skip ourselves
+                            const ev = buildGroupInviteEvent(updated.groupId, updated.groupKeyHex, updated.name, updated.members, identity.privkeyHex, mHex);
+                            await publishEvent(ev);
+                            await new Promise(r => setTimeout(r, 100)); // small delay
+                          }
+                          setAddMemberInput(''); setAddMemberError('');
+                        }}/>
+                      {addMemberError && <p style={{ color:'#f87171', fontSize:10.5 }}>{addMemberError}</p>}
+                      <p style={{ color:'rgba(255,255,255,.15)', fontSize:10, marginTop:4 }}>Press Enter to add</p>
+                    </div>
+                  )}
+
+                  {currentGroup.createdBy === identity.pubkeyHex ? (
+                    <button onClick={async () => {
+                        if (confirm('Delete this group? This will remove it from your device for everyone. Since this is decentralized, others might still see it until they also remove it.')) {
+                          await deleteGroup(currentGroup.groupId);
+                          setGroups(prev => prev.filter(g => g.groupId !== currentGroup.groupId));
+                          router.push('/chat/_');
+                        }
+                      }}
+                      style={{ width:'100%', marginTop:18, padding:'8px', borderRadius:9, background:'rgba(239,68,68,.06)', border:'1px solid rgba(239,68,68,.12)', color:'rgba(248,113,113,.7)', fontSize:11.5, fontWeight:600 }}
+                      onMouseEnter={e=>{e.currentTarget.style.background='rgba(239,68,68,.12)';}} onMouseLeave={e=>{e.currentTarget.style.background='rgba(239,68,68,.06)';}}>
+                      Delete group
+                    </button>
+                  ) : (
+                    <button onClick={async () => {
+                        await deleteGroup(currentGroup.groupId);
+                        setGroups(prev => prev.filter(g => g.groupId !== currentGroup.groupId));
+                        router.push('/chat/_');
+                      }}
+                      style={{ width:'100%', marginTop:18, padding:'8px', borderRadius:9, background:'rgba(239,68,68,.04)', border:'1px solid rgba(255,255,255,.05)', color:'rgba(255,255,255,.35)', fontSize:11.5, fontWeight:500 }}
+                      onMouseEnter={e=>{e.currentTarget.style.background='rgba(255,255,255,.08)';}} onMouseLeave={e=>{e.currentTarget.style.background='rgba(239,68,68,.06)';}}>
+                      Leave group
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Relay warning */}
+            {relayStatus !== 'connected' && (
+              <div style={{ margin:'0 20px 6px', display:'flex', alignItems:'center', gap:8, padding:'7px 13px', background:'rgba(245,158,11,.04)', border:'1px solid rgba(245,158,11,.1)', borderRadius:9 }}>
+                <div style={{ width:7, height:7, borderRadius:'50%', background:relayColor, flexShrink:0 }}/>
+                <p style={{ color:'rgba(245,158,11,.55)', fontSize:11.5, flex:1 }}>{relayStatus==='connecting'?'Connecting to relays…':'Relay disconnected'}</p>
+              </div>
+            )}
+            {mediaSending && (
+              <div style={{ margin:'0 20px 6px', display:'flex', alignItems:'center', gap:8, padding:'7px 13px', background:'rgba(99,102,241,.04)', border:'1px solid rgba(99,102,241,.12)', borderRadius:9 }}>
+                <div style={{ width:10, height:10, border:'1.5px solid rgba(255,255,255,.1)', borderTop:'1.5px solid #6366f1', borderRadius:'50%', animation:'spin .8s linear infinite', flexShrink:0 }}/>
+                <p style={{ color:'rgba(139,92,246,.7)', fontSize:11.5 }}>Sending media…</p>
+              </div>
+            )}
+
+            {/* Group input */}
+            <div className="input-area" style={{ padding:'8px 20px 16px', flexShrink:0 }}>
+              <div className="input-box" style={{ display:'flex', alignItems:'flex-end', gap:8, background:'rgba(255,255,255,.04)', border:'1.5px solid rgba(255,255,255,.07)', borderRadius:16, padding:'8px 8px 8px 14px', transition:'border-color .2s,box-shadow .2s' }}>
+                <button onClick={() => fileImgRef.current?.click()} className="med-btn" title="Send image"
+                  style={{ width:30, height:30, borderRadius:9, display:'flex', alignItems:'center', justifyContent:'center', color:'rgba(255,255,255,.35)', background:'transparent' }} disabled={mediaSending}>
+                  {Icon.image}
+                </button>
+                <div style={{ width:1, height:20, background:'rgba(255,255,255,.07)', alignSelf:'flex-end', marginBottom:5 }}/>
+                <textarea ref={inputRef} value={input}
+                  onChange={e => { setInput(e.target.value); e.target.style.height='auto'; e.target.style.height=Math.min(e.target.scrollHeight,130)+'px'; }}
+                  onKeyDown={handleKeyDown}
+                  placeholder={`Message ${currentGroup?.name||'group'}…`}
+                  rows={1}
+                  style={{ flex:1, background:'transparent', border:'none', color:'rgba(255,255,255,.85)', fontSize:14, lineHeight:1.55, minHeight:26, maxHeight:130, overflowY:'auto' }}/>
+                <button onClick={handleGroupSend} disabled={sending||!input.trim()} className="send-btn"
+                  style={{ width:36, height:36, borderRadius:11, background:input.trim()&&!sending?'linear-gradient(135deg,#6366f1,#7c3aed)':'rgba(255,255,255,.05)', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, boxShadow:input.trim()&&!sending?'0 4px 14px rgba(99,102,241,.4)':'none', border:'none', color:input.trim()&&!sending?'#fff':'rgba(255,255,255,.2)' }}>
+                  {sending ? <div style={{ width:12, height:12, border:'1.5px solid rgba(255,255,255,.2)', borderTop:'1.5px solid #fff', borderRadius:'50%', animation:'spin .7s linear infinite' }}/> : Icon.send}
+                </button>
+              </div>
+            </div>
+
+            {/* Hidden image file input — group version */}
+            <input type="file" accept="image/*" style={{ display:'none' }}
+              onChange={e => { if (e.target.files[0]) handleGroupImageFile(e.target.files[0]); e.target.value=''; }}
+              ref={r => { if (r && isGroup) fileImgRef._groupRef = r; }}/>
+          </div>
+        ) : peerPubkey ? (
           <div style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0, background:'#080809', position:'relative', zIndex:1 }}
             onClick={() => { setMenuMsg(null); setEmojiPickerMsg(null); }}>
 
@@ -1247,7 +1783,7 @@ export default function ChatPage() {
               )}
             </div>
           </div>
-        )}
+        ) : null}
 
         {/* ── Incoming call banner ── */}
         {incomingCall && (
