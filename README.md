@@ -1,36 +1,107 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://github.com/vercel/next.js/tree/canary/packages/create-next-app).
+# Abrigo v2 — Decentralized Private Messenger
 
-## Getting Started
+**No phone. No email. No accounts. No servers.**
 
-First, run the development server:
+Built on the [Nostr protocol](https://nostr.com) — a fully decentralized, censorship-resistant messaging standard used by millions.
+
+---
+
+## Architecture
+
+| Layer | Technology | Privacy |
+|---|---|---|
+| Identity | secp256k1 keypair (stored in IndexedDB only) | Private key never leaves device |
+| Transport | Nostr relays (WebSocket) | Open, anyone can run a relay |
+| Encryption | NIP-44 (X25519 + ChaCha20-Poly1305) | Relay cannot read content |
+| Storage | None — all local | No database, no cloud |
+| Auth | Zero — key IS the auth | No password, no OTP |
+
+---
+
+## How it works
+
+### Identity
+- Your **private key (`nsec`)** is generated once and stored only in your browser's IndexedDB
+- Your **public key (`npub`)** is your shareable ID — like a username
+- Share your `npub` with people who want to message you
+- Import your `nsec` on any device to restore full access + message history
+
+### Messages
+- Encrypted with **NIP-44** before leaving your device
+- Published to connected **Nostr relays** (WebSocket servers)
+- Relays see: sender pubkey, recipient pubkey, timestamp, encrypted blob — **nothing else**
+- Both sender and recipient can decrypt using ECDH shared secret (X25519)
+
+### Relays
+Default relays (free, public):
+- `wss://relay.damus.io`
+- `wss://nos.lol`
+- `wss://relay.nostr.band`
+
+You can add custom/self-hosted relays in Settings for maximum privacy.
+
+---
+
+## Setup
 
 ```bash
+cd web
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+No `.env` needed. No Firebase. No API keys.
 
-You can start editing the page by modifying `app/page.js`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Files changed from v1
 
-## Learn More
+| File | Change |
+|---|---|
+| `lib/identity.js` | NEW — keypair management, contacts, IDB storage |
+| `lib/nostr.js` | NEW — Nostr protocol (events, relay pool, NIP-44) |
+| `lib/auth-context.js` | Rewritten — keypair-based, no phone/email |
+| `app/login/page.js` | Rewritten — generate or import nsec |
+| `app/chat/[chatId]/page.js` | Rewritten — Nostr DMs, real-time via WebSocket |
+| `package.json` | Removed Firebase, added nostr-tools |
+| `app/api/` | **Deleted** — no server-side code needed |
+| `app/setup/`, `app/verify/` | **Deleted** — not needed |
+| `lib/firebase.js`, `lib/db.js`, `lib/crypto.js` | **Replaced** |
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Privacy guarantees
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| What | Who can see it |
+|---|---|
+| Message content | Only sender + recipient |
+| Who sent a message | Relays (sender pubkey is visible — use private relay to hide) |
+| Who is talking to whom | Relays (both pubkeys tagged — use private relay to hide) |
+| Your phone number | Nobody |
+| Your email | Nobody |
+| Your IP address | The relay you connect to (use Tor/VPN to hide) |
 
-## Deploy on Vercel
+---
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Multi-device
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+1. In Settings, reveal your `nsec`
+2. Copy it to a password manager
+3. On any new device: open Abrigo → "Import key" → paste `nsec`
+4. All your message history loads automatically from relays
+
+---
+
+## Self-hosting a relay (optional, max privacy)
+
+```bash
+git clone https://github.com/hoytech/strfry
+# or
+docker run -p 7777:7777 scsibug/nostr-rs-relay
+```
+
+Then add `wss://your-server.com` in Abrigo Settings → Relays.
+
+---
+
+*Abrigo — shelter from surveillance.*

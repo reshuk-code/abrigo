@@ -4,7 +4,7 @@ import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
 
-export default function Home() {
+export default function ChatIndexPage() {
   const { identity, loading } = useAuth();
   const router = useRouter();
 
