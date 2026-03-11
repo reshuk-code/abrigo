@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
 import {
@@ -16,6 +16,7 @@ import {
 } from '@/lib/nostr';
 import { createCallSession, subscribeIncomingCalls } from '@/lib/webrtc';
 import { CallOverlay, IncomingCallBanner } from '@/components/CallOverlay';
+import ShareProfileModal from '@/components/ShareProfileModal';
 import {
   getContacts, saveContact, removeContact,
   getCachedMessages, cacheMessage,
@@ -197,6 +198,7 @@ export default function ChatPage() {
   const recTimerRef  = useRef(null);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showShare,   setShowShare]   = useState(false);
 
   // ── Group state ─────────────────────────────────────────────────────────────────
   const [currentGroup,   setCurrentGroup]   = useState(null);  // group object
@@ -795,6 +797,7 @@ export default function ChatPage() {
         </div>
       )}
 
+      <ShareProfileModal identity={identity} onClose={() => setShowShare(false)} open={showShare} />
       <div style={{ height:'100vh', display:'flex', background:'#080809', overflow:'hidden', fontSize:13.5, position:'relative' }}>
 
         {/* Ambient glows */}
@@ -939,6 +942,39 @@ export default function ChatPage() {
               <div style={{ display:'flex', alignItems:'flex-start', gap:8, padding:'10px 13px', background:'rgba(239,68,68,.04)', border:'1px solid rgba(239,68,68,.1)', borderRadius:10, marginBottom:22 }}>
                 <svg width="13" height="13" viewBox="0 0 14 14" fill="none" style={{ flexShrink:0, marginTop:1 }}><path d="M7 2L1.5 11.5h11L7 2z" stroke="rgba(239,68,68,.5)" strokeWidth="1.2" strokeLinejoin="round"/><path d="M7 6v2.5M7 10.5v.3" stroke="rgba(239,68,68,.5)" strokeWidth="1.3" strokeLinecap="round"/></svg>
                 <p style={{ color:'rgba(239,68,68,.55)', fontSize:11, lineHeight:1.7 }}>Back up your nsec. No password reset — losing it means losing access permanently.</p>
+              </div>
+
+              {/* Share Profile */}
+              <p style={{ color:'rgba(255,255,255,.2)', fontSize:10, fontWeight:700, letterSpacing:'.12em', textTransform:'uppercase', marginBottom:10 }}>Share Profile</p>
+              <div style={{ background:'rgba(255,255,255,.03)', border:'1px solid rgba(255,255,255,.06)', borderRadius:12, padding:16, marginBottom:22, textAlign:'center' }}>
+                <div style={{ background:'#fff', padding:8, borderRadius:12, width:140, height:140, margin:'0 auto 16px', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 8px 24px rgba(0,0,0,0.2)' }}>
+                  <img src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent('https://abrigo-w3.antqr.xyz/join/' + identity.npub)}`}
+                    alt="Join QR" style={{ width:'100%', height:'100%' }} />
+                </div>
+                <p style={{ color:'rgba(255,255,255,0.3)', fontSize:11, marginBottom:8 }}>Scan to join or share your link</p>
+                <div style={{ display:'flex', alignItems:'center', gap:8, background:'rgba(255,255,255,0.04)', padding:'8px 10px', borderRadius:8, marginBottom:16 }}>
+                  <span style={{ color:'rgba(255,255,255,0.5)', fontSize:10.5, flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', fontFamily:"'DM Mono', monospace" }}>
+                    abrigo-w3.antqr.xyz/join/{identity.npub.slice(0, 12)}...
+                  </span>
+                  <button onClick={() => copy(`https://abrigo-w3.antqr.xyz/join/${identity.npub}`, 'join-link')}
+                    className="pill" style={{ padding:'5px 10px', borderRadius:6, background:copied==='join-link'?'rgba(52,211,153,0.1)':'rgba(99,102,241,0.1)', color:copied==='join-link'?'#34d399':'rgba(139,92,246,0.8)', fontSize:11, border:'1px solid rgba(99,102,241,0.2)' }}>
+                    {copied==='join-link' ? '✓ Copied' : 'Copy'}
+                  </button>
+                </div>
+
+                <div style={{ display:'flex', gap:8, justifyContent:'center' }}>
+                  {[
+                    { label: 'X', color: '#000', icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>, url: `https://twitter.com/intent/tweet?text=${encodeURIComponent(identity.displayName + ' is on Abrigo, join them for secure and private chat.')}&url=${encodeURIComponent('https://abrigo-w3.antqr.xyz/join/' + identity.npub)}` },
+                    { label: 'FB', color: '#1877f2', icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/></svg>, url: `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent('https://abrigo-w3.antqr.xyz/join/' + identity.npub)}` },
+                    { label: 'WA', color: '#25d366', icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>, url: `https://wa.me/?text=${encodeURIComponent(identity.displayName + ' is on Abrigo, join them for secure chat: https://abrigo-w3.antqr.xyz/join/' + identity.npub)}` }
+                  ].map((s, i) => (
+                    <a key={i} href={s.url} target="_blank" rel="noopener noreferrer"
+                      style={{ width:34, height:34, borderRadius:10, background:s.color, color:'#fff', display:'flex', alignItems:'center', justifyContent:'center', transition:'transform 0.15s' }}
+                      onMouseEnter={e=>e.currentTarget.style.transform='scale(1.1)'} onMouseLeave={e=>e.currentTarget.style.transform='scale(1)'}>
+                      {s.icon}
+                    </a>
+                  ))}
+                </div>
               </div>
 
               {/* Relays */}
@@ -1216,14 +1252,21 @@ export default function ChatPage() {
                 <img src="/logo.svg" alt="abrigo" style={{ width:'100%', height:'100%', display:'block' }} />
               </div>
               <h2 style={{ color:'rgba(255,255,255,.7)', fontSize:18, fontWeight:600, marginBottom:6 }}>Your messages</h2>
-              <p style={{ color:'rgba(255,255,255,.2)', fontSize:13, lineHeight:1.7, marginBottom:28 }}>Select a conversation or start a new one. All messages are end-to-end encrypted.</p>
-              <div style={{ padding:'16px 20px', background:'rgba(255,255,255,.025)', border:'1px solid rgba(255,255,255,.06)', borderRadius:14, textAlign:'left' }}>
+              <p style={{ color:'rgba(255,255,255,.2)', fontSize:13, lineHeight:1.7, marginBottom:20 }}>Select a conversation or start a new one. All messages are end-to-end encrypted.</p>
+              <div style={{ padding:'16px 20px', background:'rgba(255,255,255,.025)', border:'1px solid rgba(255,255,255,.06)', borderRadius:14, textAlign:'left', marginBottom:12 }}>
                 <p style={{ color:'rgba(255,255,255,.28)', fontSize:11, fontWeight:600, letterSpacing:'.06em', textTransform:'uppercase', marginBottom:10 }}>Your public key</p>
                 <p style={{ color:'rgba(255,255,255,.45)', fontSize:10.5, fontFamily:"'DM Mono',monospace", wordBreak:'break-all', lineHeight:1.7, marginBottom:12 }}>{identity.npub}</p>
-                <button onClick={() => copy(identity.npub, 'npub-main')} className="pill"
-                  style={{ width:'100%', padding:'8px', borderRadius:8, background:copied==='npub-main'?'rgba(52,211,153,.1)':'rgba(99,102,241,.08)', color:copied==='npub-main'?'#34d399':'rgba(139,92,246,.8)', fontSize:12, border:`1px solid ${copied==='npub-main'?'rgba(52,211,153,.2)':'rgba(99,102,241,.15)'}`, fontWeight:500 }}>
-                  {copied==='npub-main'?'✓ Copied to clipboard':'Copy npub'}
-                </button>
+                <div style={{ display:'flex', gap:8 }}>
+                  <button onClick={() => copy(identity.npub, 'npub-main')} className="pill"
+                    style={{ flex:1, padding:'8px', borderRadius:8, background:copied==='npub-main'?'rgba(52,211,153,.1)':'rgba(99,102,241,.08)', color:copied==='npub-main'?'#34d399':'rgba(139,92,246,.8)', fontSize:12, border:`1px solid ${copied==='npub-main'?'rgba(52,211,153,.2)':'rgba(99,102,241,.15)'}`, fontWeight:500 }}>
+                    {copied==='npub-main'?'✓ Copied':'Copy npub'}
+                  </button>
+                  <button onClick={() => setShowShare(true)} className="pill"
+                    style={{ flex:1, padding:'8px', borderRadius:8, background:'rgba(99,102,241,.12)', color:'rgba(139,92,246,.9)', fontSize:12, border:'1px solid rgba(99,102,241,.2)', fontWeight:500, display:'flex', alignItems:'center', justifyContent:'center', gap:6 }}>
+                    <svg width="12" height="12" viewBox="0 0 14 14" fill="none"><circle cx="11" cy="2.5" r="1.8" stroke="currentColor" strokeWidth="1.2"/><circle cx="11" cy="11.5" r="1.8" stroke="currentColor" strokeWidth="1.2"/><circle cx="3" cy="7" r="1.8" stroke="currentColor" strokeWidth="1.2"/><path d="M4.7 6.1L9.3 3.4M4.7 7.9l4.6 2.7" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+                    Share & QR
+                  </button>
+                </div>
               </div>
             </div>
             </div>
